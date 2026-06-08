@@ -33,21 +33,22 @@ if { [file exists ./config.tcl] } {
 
   # Configurações para teste
   array set CONFIG {
-        telegram_bot_token "SEU_BOT_TOKEN_AQUI"
-        telegram_chat_id "SEU_CHAT_ID_AQUI"
-        metrics_db "/var/log/swarm_metrics.db"
-        http_port 9090
-        collect_interval 10
-        analysis_window 300
-        memory_threshold_warning 80
-        memory_threshold_critical 90
-        cpu_threshold_warning 80
-        cpu_threshold_critical 90
-        disk_threshold_warning 85
-        disk_threshold_critical 95
-        critical_services_update 4gym_4gym
-        service_update_stack_deploy_cmd "into ~/cluster, ./swr deploy 4gym"
-    }
+    telegram_bot_token "SEU_BOT_TOKEN_AQUI"
+    telegram_chat_id "SEU_CHAT_ID_AQUI"
+    metrics_db "/var/log/swarm_metrics.db"
+    http_port 9090
+    collect_interval 10
+    analysis_window 300
+    memory_threshold_warning 85
+    memory_threshold_critical 95
+    cpu_threshold_warning 85
+    cpu_threshold_critical 95
+    disk_threshold_warning 85
+    disk_threshold_critical 95
+    critical_services_update 4gym_4gym
+    service_update_stack_deploy_cmd "into ~/cluster, ./swr deploy 4gym"
+    endpoint_monitor {https://www.4gym.com.br/error/failure}
+  }
 }
 
 # Variáveis globais
@@ -65,23 +66,23 @@ proc init_database { } {
   sqlite3 db $CONFIG(metrics_db)
 
   db eval {
-        CREATE TABLE IF NOT EXISTS metrics (
-            timestamp INTEGER PRIMARY KEY,
-            hostname TEXT,
-            cpu_usage REAL,
-            memory_usage REAL,
-            memory_total INTEGER,
-            memory_available INTEGER,
-            disk_usage REAL,
-            load_avg REAL,
-            docker_containers INTEGER,
-            docker_services INTEGER,
-            action_taken TEXT
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_timestamp ON metrics(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_hostname ON metrics(hostname);
-    }
+    CREATE TABLE IF NOT EXISTS metrics (
+    timestamp INTEGER PRIMARY KEY,
+    hostname TEXT,
+    cpu_usage REAL,
+    memory_usage REAL,
+    memory_total INTEGER,
+    memory_available INTEGER,
+    disk_usage REAL,
+    load_avg REAL,
+    docker_containers INTEGER,
+    docker_services INTEGER,
+    action_taken TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_timestamp ON metrics(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_hostname ON metrics(hostname);
+  }
 }
 
 # ==============================================================================
@@ -119,7 +120,7 @@ proc get_system_metrics { } {
   dict set metrics docker_services [dict get $docker_info services]
 
   # Docker containers stats
-  #dict set metrics docker_containers_stats [get_containers_stats]
+  dict set metrics docker_containers_stats [get_containers_stats]
 
   # Timestamp
   dict set metrics timestamp [clock seconds]
@@ -230,6 +231,95 @@ proc get_containers_stats { } {
   return $containers
 }
 
+proc analyze_metrics_by_service { metrics_list } {
+  global CONFIG
+
+  if { [llength $metrics_list] == 0 } {
+    log_message "INFO" "no metrics for services found"
+    return {}
+  }
+
+  # Calcular médias dos últimos 5 minutos
+
+  foreach metrics $metrics_list {
+    set cpu_sum 0.0
+    set memory_sum 0.0
+    set stats {}
+    set containers_stats [dict get $metrics docker_containers_stats]
+
+    foreach container $containers_stats {
+      set stat {}
+      set id [dict get $container id]
+
+      if { [dict exists $stats $id] } {
+        set stat [dict get $stats $id]
+        dict set stat cpu_usage [expr { [dict get $stat cpu_usage] + [dict get $container cpu_usage] }]
+        dict set stat memory_usage [expr { [dict get $stat memory_usage] + [dict get $container memory_usage] }]
+        dict set stat count [expr { [dict get $stat count] + 1 }]
+      } else {
+        dict set stat id $id
+        dict set stat name [dict get $container name]
+        dict set stat cpu_usage [dict get $container cpu_usage]
+        dict set stat memory_usage [dict get $container memory_usage]
+        dict set stat count 1
+      }
+
+      dict set stats $id $stat
+
+      set cpu_usage [dict get $stat cpu_usage]
+      set memory_usage [dict get $stat memory_usage]
+      set name [dict get $stat name]
+
+      log_message "INFO" "service:$name, memory_sum:$memory_usage%, cpu_sum:$cpu_usage%"
+    }
+  }
+
+  set containers_to_down {}
+
+  foreach stat [dict values $stats] {
+    set id [dict get $stat id]
+    set name [dict get $stat name]
+    set cpu_usage [dict get $stat cpu_usage]
+    set memory_usage [dict get $stat memory_usage]
+    set n [dict get $stat count]
+
+    set avg_cpu [expr { $cpu_usage / $n }]
+    set avg_memory [expr { $memory_usage / $n }]
+
+    if { $avg_cpu >= $CONFIG(cpu_threshold_critical) } {
+      lappend containers_to_down [dict create \
+        name $name \
+        id $id \
+        severity "critical" \
+        reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
+    } elseif { $avg_cpu >= $CONFIG(cpu_threshold_warning) } {
+      lappend containers_to_down [dict create \
+        name $name \
+        id $id \
+        severity "critical" \
+        reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
+    }
+
+    if { $avg_memory >= $CONFIG(memory_threshold_critical) } {
+      lappend containers_to_down [dict create \
+        name $name \
+        id $id \
+        severity "critical" \
+        reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
+    } elseif { $avg_memory >= $CONFIG(memory_threshold_warning) } {
+      lappend containers_to_down [dict create \
+        name $name \
+        id $id \
+        severity "warning" \
+        reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
+    }
+
+    log_message "INFO" "Média $name - CPU: ${avg_cpu}% | Memory: ${avg_memory}%"
+  }
+
+  return $containers_to_down
+}
+
 # ==============================================================================
 # Funções de Análise e Decisão
 # ==============================================================================
@@ -252,71 +342,12 @@ proc analyze_metrics { metrics_list } {
     set cpu_sum [expr { $cpu_sum + [dict get $metrics cpu_usage] }]
     set memory_sum [expr { $memory_sum + [dict get $metrics memory_usage] }]
     set disk_sum [expr { $disk_sum + [dict get $metrics disk_usage] }]
-
-    #set containers_stats [dict get $metrics docker_containers_stats]
-
-    #    foreach container $containers_stats {
-    #      set stat {}
-    #      set id [dict get $container id]
-    #
-    #      if { [dict exists $stats $id] } {
-    #        set stat [dict get $stats $id]
-    #        dict set stat cpu_usage [expr { [dict get $stat cpu_usage] + [dict get $container cpu_usage] }]
-    #        dict set stat memory_usage [expr { [dict get $stat memory_usage] + [dict get $container memory_usage] }]
-    #        dict set stat count [expr { [dict get $stat count] + 1 }]
-    #      } else {
-    #        dict set stat id $id
-    #        dict set stat name [dict get $container name]
-    #        dict set stat cpu_usage [dict get $container cpu_usage]
-    #        dict set stat memory_usage [dict get $container memory_usage]
-    #        dict set stat count 1
-    #      }
-    #
-    #      dict set stats $id $stat
-    #    }
-
-    #log_message "INFO" "memory_sum:[dict get $metrics memory_usage]%, cpu_sum:[dict get $metrics cpu_usage]%"
-
     incr count
   }
 
   if { $count == 0 } {
     return [dict create action "none" severity "info"]
   }
-
-  #  set containers_to_down {}
-  #
-  #  foreach stat [dict values $stats] {
-  #    set id [dict get $stat id]
-  #    set name [dict get $stat name]
-  #    set cpu_usage [dict get $stat cpu_usage]
-  #    set memory_usage [dict get $stat memory_usage]
-  #    set n [dict get $stat count]
-  #
-  #    if { $n < $count } {
-  #      log_message "INFO" "Ainda não há informações suficientes para analisar o container $name"
-  #      continue
-  #    }
-  #
-  #    set avg_cpu [expr { $cpu_usage / $n }]
-  #    set avg_memory [expr { $memory_usage / $n }]
-  #
-  #    if { $avg_cpu >= $CONFIG(cpu_threshold_critical) } {
-  #      lappend containers_to_down [dict create \
-#        name $name \
-#        id $id \
-#        reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
-  #    }
-  #
-  #    if { $avg_memory >= $CONFIG(memory_threshold_critical) } {
-  #      lappend containers_to_down [dict create \
-#        name $name \
-#        id $id \
-#        reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
-  #    }
-  #
-  #    log_message "INFO" "Média $name - CPU: ${avg_cpu}% | Memory: ${avg_memory}%"
-  #  }
 
   set avg_cpu [expr { $cpu_sum / $count }]
   set avg_memory [expr { $memory_sum / $count }]
@@ -343,11 +374,11 @@ proc analyze_metrics { metrics_list } {
     set severity "critical"
     set reason "Disco crítico: [expr { int($avg_disk) }]%"
   } elseif { $avg_memory >= $CONFIG(memory_threshold_warning) } {
-    set action "scale_down_services"
+    set action "none"
     set severity "warning"
     set reason "Memória alta: [expr { int($avg_memory) }]%"
   } elseif { $avg_cpu >= $CONFIG(cpu_threshold_warning) } {
-    set action "scale_down_services"
+    set action "none"
     set severity "warning"
     set reason "CPU alto: [expr { int($avg_cpu) }]%"
   } elseif { $avg_disk >= $CONFIG(disk_threshold_warning) } {
@@ -356,14 +387,20 @@ proc analyze_metrics { metrics_list } {
     set reason "Disco alto: [expr { int($avg_disk) }]%"
   }
 
+  set containers_to_down {}
+
+  if { $severity == "critical" } {
+    set containers_to_down [analyze_metrics_by_service $metrics_list]
+  }
+
   return [dict create \
     action $action \
     severity $severity \
     reason $reason \
     avg_cpu $avg_cpu \
     avg_memory $avg_memory \
-    avg_disk $avg_disk]
-  # containers_to_down $containers_to_down
+    avg_disk $avg_disk \
+    containers_to_down $containers_to_down]
 }
 
 # ==============================================================================
@@ -374,53 +411,61 @@ proc execute_action { analysis } {
   set action [dict get $analysis action]
   set severity [dict get $analysis severity]
   set reason [dict get $analysis reason]
-  # set containers_to_down [dict get $analysis containers_to_down]
+  set containers_to_down [dict get $analysis containers_to_down]
   set action_executed false
 
-  #if { [llength $containers_to_down] > 0 } {
-  #  foreach container $containers_to_down {
-  #    set creason [dict get $container reason]
-  #    set cname [dict get $container name]
-  #    set cid [dict get $container id]
-  #    log_message "ACTION" "Container removido - $reason"
-  #    send_telegram_notification "critical" "stop_container" $creason
+  if { [llength $containers_to_down] > 0 } {
+    foreach container $containers_to_down {
+      set reason [dict get $container reason]
+      set service_name [dict get $container name]
+      set id [dict get $container id]
+      set cpu_usage [dict get $container cpu_usage]
+      set memory_usage [dict get $container memory_usage]
+
+      send_telegram_notification "critical" "stoping_container" $reason
+
+      if {[stop_container $service_name $id $cpu_usage $memory_usage]} {
+        send_telegram_notification "critical" "stoped_container" "container ${service_name} sucessfully stoped"
+      } else {
+        send_telegram_notification "critical" "stop_container_error" "canot stop container ${service_name}"
+      }
+    }
+  } else {
+    send_telegram_notification "critical" "server_exhausted" "The server is exhausted, but no services were found to stop"
+  }
+
+  #switch $action {
+  #  "scale_down_services" {
+  #    log_message "ACTION" "Serviços redimensionados - $reason"
+  #    #scale_down_services
+  #    try {
+  #      if { ![update_services $severity $reason] } {
+  #        return false
+  #      }
+  #      return true
+  #    } on error err {
+  #      log_message "ERROR" "Ocorreu um erro ao executar atualização de serviços: $err"
+  #      send_telegram_notification $severity $action "Ocorreu um erro ao executar atualização de serviços: $err"
+  #    }
+  #    return false
+  #  }
+  #  "restart_docker" {
+  #    #restart_docker_service
+  #    log_message "ACTION" "Docker reiniciado - $reason"
   #    set action_executed true
+  #  }
+  #  "cleanup_docker" {
+  #    #cleanup_docker_resources
+  #    log_message "ACTION" "Limpeza do Docker executada - $reason"
+  #    set action_executed true
+  #  }
+  #  "none" {
+  #    return false
   #  }
   #}
 
-  switch $action {
-    "scale_down_services" {
-      log_message "ACTION" "Serviços redimensionados - $reason"
-      #scale_down_services
-      try {
-        if { ![update_services $severity $reason] } {
-          return false
-        }
-        return true
-      } on error err {
-        log_message "ERROR" "Ocorreu um erro ao executar atualização de serviços: $err"
-        send_telegram_notification $severity $action "Ocorreu um erro ao executar atualização de serviços: $err"
-      }
-
-      return false
-    }
-    "restart_docker" {
-      #restart_docker_service
-      log_message "ACTION" "Docker reiniciado - $reason"
-      set action_executed true
-    }
-    "cleanup_docker" {
-      #cleanup_docker_resources
-      log_message "ACTION" "Limpeza do Docker executada - $reason"
-      set action_executed true
-    }
-    "none" {
-      return false
-    }
-  }
-
   # Notificar via Telegram
-  send_telegram_notification $severity $action $reason
+  #send_telegram_notification $severity $action $reason
 
   return $action_executed
 }
@@ -522,8 +567,8 @@ proc scale_down_services { } {
 }
 
 # Função para parar um container
-proc stop_container { container_id container_name cpu_usage } {
-  log_message "INFO" "Parando container $container_name ($container_id) - CPU: ${cpu_usage}%"
+proc stop_container { container_name container_id cpu_usage memory_usage } {
+  log_message "INFO" "Parando container $container_name ($container_id) - CPU: ${cpu_usage}%, Memory: ${memory_usage}%"
 
   if { [catch { exec docker stop $container_id } result] } {
     log_message "ERROR" "Falha ao parar container $container_name: $result"
@@ -612,6 +657,31 @@ proc send_telegram_notification { severity action reason } {
     http::cleanup $token
   } on error err {
     log_message "ERROR" "Falha ao enviar notificação Telegram: $err"
+  }
+}
+
+proc monitore_endepoins {} {
+
+  global CONFIG
+
+  set endpoints $CONFIG(endpoint_monitor)
+
+  foreach url $endpoints {
+
+    try {
+      set token [http::geturl $url -timeout 10000]
+      set resp [http::data $token]
+
+      if {[expr $resp > 15]} {
+        set reason "A URL $url retornou $resp falhas, o serviço precisa ser reiniciado"
+        execute_action [list action scale_down_services severity critical reason $reason]
+      }
+
+      http::cleanup $token
+    } on error err {
+      log_message "ERROR" "Falha ao verificar endpoint $url: $err"
+    }
+
   }
 }
 
@@ -739,16 +809,16 @@ proc store_metrics { metrics action_taken } {
   set docker_services [dict get $metrics docker_services]
 
   db eval {
-        INSERT INTO metrics (
-            timestamp, hostname, cpu_usage, memory_usage, memory_total,
-            memory_available, disk_usage, load_avg, docker_containers,
-            docker_services, action_taken
-        ) VALUES (
-            $timestamp, $hostname, $cpu_usage, $memory_usage, $memory_total,
-            $memory_available, $disk_usage, $load_avg, $docker_containers,
-            $docker_services, $action_taken
-        )
-    }
+    INSERT INTO metrics (
+    timestamp, hostname, cpu_usage, memory_usage, memory_total,
+    memory_available, disk_usage, load_avg, docker_containers,
+    docker_services, action_taken
+    ) VALUES (
+    $timestamp, $hostname, $cpu_usage, $memory_usage, $memory_total,
+    $memory_available, $disk_usage, $load_avg, $docker_containers,
+    $docker_services, $action_taken
+    )
+  }
 
   # Limpar dados antigos (manter apenas 7 dias)
   set week_ago [expr { [clock seconds] - 604800 }]
@@ -795,10 +865,12 @@ proc main_loop { } {
   # Executar ação se necessário
   if { $action_taken ne "none" } {
     if { [execute_action $analysis] } {
-      # reset metrics if execute action
+     # reset metrics if execute action
       set metrics_history {}
     }
   }
+
+  monitore_endepoins
 
   # Armazenar métricas
   #store_metrics $current_metrics $action_taken
