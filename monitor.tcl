@@ -870,7 +870,7 @@ proc main_loop { } {
     }
   }
 
-  monitore_endepoins
+  #monitore_endepoins
 
   # Armazenar métricas
   #store_metrics $current_metrics $action_taken
