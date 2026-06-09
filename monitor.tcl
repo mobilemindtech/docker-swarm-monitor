@@ -289,12 +289,16 @@ proc analyze_metrics_by_service { metrics_list } {
     if { $avg_cpu >= $CONFIG(cpu_threshold_critical) } {
       lappend containers_to_down [dict create \
         name $name \
+        cpu_usage $cpu_usage \
+        memory_usage $memory_usage \
         id $id \
         severity "critical" \
         reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
     } elseif { $avg_cpu >= $CONFIG(cpu_threshold_warning) } {
       lappend containers_to_down [dict create \
         name $name \
+        cpu_usage $cpu_usage \
+        memory_usage $memory_usage \
         id $id \
         severity "critical" \
         reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
@@ -303,12 +307,16 @@ proc analyze_metrics_by_service { metrics_list } {
     if { $avg_memory >= $CONFIG(memory_threshold_critical) } {
       lappend containers_to_down [dict create \
         name $name \
+        cpu_usage $cpu_usage \
+        memory_usage $memory_usage \
         id $id \
         severity "critical" \
         reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
     } elseif { $avg_memory >= $CONFIG(memory_threshold_warning) } {
       lappend containers_to_down [dict create \
         name $name \
+        cpu_usage $cpu_usage \
+        memory_usage $memory_usage \
         id $id \
         severity "warning" \
         reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
