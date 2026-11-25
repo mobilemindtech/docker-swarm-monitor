@@ -38,7 +38,7 @@ if { [file exists ./config.tcl] } {
     metrics_db "/var/log/swarm_metrics.db"
     http_port 9090
     collect_interval 10
-    analysis_window 300
+    analysis_window 600
     memory_threshold_warning 85
     memory_threshold_critical 95
     cpu_threshold_warning 85
