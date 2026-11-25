@@ -51,10 +51,32 @@ if { [file exists ./config.tcl] } {
   }
 }
 
+# Configurações opcionais (o config.tcl de produção pode não ter estas chaves)
+#   stop_cooldown: segundos sem nova parada depois de parar um container. Dá tempo do container
+#     subir (a inicialização de um app Java usa muita CPU) e da média da janela refletir a parada.
+#   container_min_share: participação mínima (%) do container no recurso do servidor, na média da
+#     janela, para ser parado. Abaixo disso o container não é a causa e nada é parado.
+#   protected_services: padrões (glob) de nomes de container que nunca são parados (ex.: banco).
+foreach { key value } {
+  stop_cooldown 600
+  container_min_share 20
+  protected_services {}
+} {
+  if { ![info exists CONFIG($key)] } {
+    set CONFIG($key) $value
+  }
+}
+
 # Variáveis globais
 set metrics_history {}
 set last_notification {}
 set http_server_socket ""
+set last_stop_time 0
+
+# docker stats mede CPU por núcleo (100% = 1 núcleo); para comparar com o servidor divide pelo nº de núcleos
+if { [catch { exec nproc } cpu_count] || ![string is integer -strict $cpu_count] || $cpu_count < 1 } {
+  set cpu_count 1
+}
 
 # ==============================================================================
 # Funções de Configuração e Inicialização
@@ -231,101 +253,108 @@ proc get_containers_stats { } {
   return $containers
 }
 
-proc analyze_metrics_by_service { metrics_list } {
+proc is_protected { name } {
   global CONFIG
+  foreach pattern $CONFIG(protected_services) {
+    if { [string match $pattern $name] } {
+      return 1
+    }
+  }
+  return 0
+}
+
+# Escolhe o container a parar quando o servidor está crítico em CPU ou memória.
+#
+# - Média de cada container em toda a janela, não a leitura instantânea: um pico de 1 segundo
+#   (GC, um job curto) não faz o container ser escolhido.
+# - CPU convertida para participação no servidor (docker stats: 100% = 1 núcleo).
+# - Só containers presentes na última coleta e com pelo menos metade das coletas da janela:
+#   um container que acabou de (re)iniciar não é escolhido pela CPU da inicialização.
+# - Só um container: o que mais pesa no recurso crítico, e só se pesar pelo menos
+#   container_min_share% do servidor. Os demais seguem rodando.
+#
+# resource: "cpu" ou "memory". Retorna uma lista com 0 ou 1 container.
+proc analyze_metrics_by_service { metrics_list resource } {
+  global CONFIG cpu_count
 
   if { [llength $metrics_list] == 0 } {
     log_message "INFO" "no metrics for services found"
     return {}
   }
 
-  # Calcular médias dos últimos 5 minutos
+  set stats {}
 
   foreach metrics $metrics_list {
-    set cpu_sum 0.0
-    set memory_sum 0.0
-    set stats {}
-    set containers_stats [dict get $metrics docker_containers_stats]
-
-    foreach container $containers_stats {
-      set stat {}
+    foreach container [dict get $metrics docker_containers_stats] {
       set id [dict get $container id]
+      set cpu [dict get $container cpu_usage]
+      set memory [dict get $container memory_usage]
 
-      if { [dict exists $stats $id] } {
-        set stat [dict get $stats $id]
-        dict set stat cpu_usage [expr { [dict get $stat cpu_usage] + [dict get $container cpu_usage] }]
-        dict set stat memory_usage [expr { [dict get $stat memory_usage] + [dict get $container memory_usage] }]
-        dict set stat count [expr { [dict get $stat count] + 1 }]
-      } else {
-        dict set stat id $id
-        dict set stat name [dict get $container name]
-        dict set stat cpu_usage [dict get $container cpu_usage]
-        dict set stat memory_usage [dict get $container memory_usage]
-        dict set stat count 1
+      if { ![string is double -strict $cpu] || ![string is double -strict $memory] } {
+        continue
       }
 
-      dict set stats $id $stat
-
-      set cpu_usage [dict get $stat cpu_usage]
-      set memory_usage [dict get $stat memory_usage]
-      set name [dict get $stat name]
-
-      log_message "INFO" "service:$name, memory_sum:$memory_usage%, cpu_sum:$cpu_usage%"
+      if { [dict exists $stats $id] } {
+        dict with stats $id {
+          set cpu_sum [expr { $cpu_sum + $cpu }]
+          set memory_sum [expr { $memory_sum + $memory }]
+          incr count
+        }
+      } else {
+        dict set stats $id [dict create \
+          id $id \
+          name [dict get $container name] \
+          cpu_sum $cpu \
+          memory_sum $memory \
+          count 1]
+      }
     }
   }
 
-  set containers_to_down {}
+  set running_ids {}
+  foreach container [dict get [lindex $metrics_list end] docker_containers_stats] {
+    lappend running_ids [dict get $container id]
+  }
+
+  set min_count [expr { max(1, [llength $metrics_list] / 2) }]
+  set candidate {}
+  set candidate_value -1
 
   foreach stat [dict values $stats] {
     set id [dict get $stat id]
     set name [dict get $stat name]
-    set cpu_usage [dict get $stat cpu_usage]
-    set memory_usage [dict get $stat memory_usage]
     set n [dict get $stat count]
+    set avg_cpu [expr { double([dict get $stat cpu_sum]) / $n / $cpu_count }]
+    set avg_memory [expr { double([dict get $stat memory_sum]) / $n }]
 
-    set avg_cpu [expr { $cpu_usage / $n }]
-    set avg_memory [expr { $memory_usage / $n }]
+    log_message "INFO" "Média $name - CPU: [format %.1f $avg_cpu]% do servidor | Memory: [format %.1f $avg_memory]% | coletas: $n"
 
-    if { $avg_cpu >= $CONFIG(cpu_threshold_critical) } {
-      lappend containers_to_down [dict create \
-        name $name \
-        cpu_usage $cpu_usage \
-        memory_usage $memory_usage \
-        id $id \
-        severity "critical" \
-        reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
-    } elseif { $avg_cpu >= $CONFIG(cpu_threshold_warning) } {
-      lappend containers_to_down [dict create \
-        name $name \
-        cpu_usage $cpu_usage \
-        memory_usage $memory_usage \
-        id $id \
-        severity "critical" \
-        reason "$name - CPU crítico: [expr { int($avg_cpu) }]%"]
+    if { $id ni $running_ids || $n < $min_count || [is_protected $name] } {
+      continue
     }
 
-    if { $avg_memory >= $CONFIG(memory_threshold_critical) } {
-      lappend containers_to_down [dict create \
-        name $name \
-        cpu_usage $cpu_usage \
-        memory_usage $memory_usage \
+    set value [expr { $resource eq "cpu" ? $avg_cpu : $avg_memory }]
+    if { $value > $candidate_value } {
+      set candidate_value $value
+      set candidate [dict create \
         id $id \
-        severity "critical" \
-        reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
-    } elseif { $avg_memory >= $CONFIG(memory_threshold_warning) } {
-      lappend containers_to_down [dict create \
         name $name \
-        cpu_usage $cpu_usage \
-        memory_usage $memory_usage \
-        id $id \
-        severity "warning" \
-        reason "$name - Memória crítica: [expr { int($avg_memory) }]%"]
+        cpu_usage [format %.1f $avg_cpu] \
+        memory_usage [format %.1f $avg_memory] \
+        severity "critical"]
     }
-
-    log_message "INFO" "Média $name - CPU: ${avg_cpu}% | Memory: ${avg_memory}%"
   }
 
-  return $containers_to_down
+  if { $candidate eq {} || $candidate_value < $CONFIG(container_min_share) } {
+    if { $candidate ne {} } {
+      log_message "INFO" "Maior consumo de $resource: [dict get $candidate name] com [format %.1f $candidate_value]%, abaixo de $CONFIG(container_min_share)%: nenhum container parado"
+    }
+    return {}
+  }
+
+  set label [expr { $resource eq "cpu" ? "CPU" : "Memória" }]
+  dict set candidate reason "[dict get $candidate name] - $label: [format %.1f $candidate_value]% do servidor (média da janela)"
+  return [list $candidate]
 }
 
 # ==============================================================================
@@ -361,7 +390,7 @@ proc analyze_metrics { metrics_list } {
   set avg_memory [expr { $memory_sum / $count }]
   set avg_disk [expr { $disk_sum / $count }]
 
-  log_message "INFO" "Médias 5min - CPU: ${avg_cpu}% | Memory: ${avg_memory}% | Disk: ${avg_disk}%"
+  log_message "INFO" "Médias ${count} coletas - CPU: ${avg_cpu}% | Memory: ${avg_memory}% | Disk: ${avg_disk}%"
 
   # Determinar ação necessária
   set action "none"
@@ -395,10 +424,19 @@ proc analyze_metrics { metrics_list } {
     set reason "Disco alto: [expr { int($avg_disk) }]%"
   }
 
+  # Só CPU e memória levam a parar um container, e o container é escolhido pelo recurso que
+  # está crítico. Disco crítico só notifica: parar container não libera disco.
   set containers_to_down {}
 
   if { $severity == "critical" } {
-    set containers_to_down [analyze_metrics_by_service $metrics_list]
+    switch $action {
+      "restart_docker" {
+        set containers_to_down [analyze_metrics_by_service $metrics_list memory]
+      }
+      "scale_down_services" {
+        set containers_to_down [analyze_metrics_by_service $metrics_list cpu]
+      }
+    }
   }
 
   return [dict create \
@@ -416,30 +454,52 @@ proc analyze_metrics { metrics_list } {
 # ==============================================================================
 
 proc execute_action { analysis } {
+  global CONFIG last_stop_time
+
   set action [dict get $analysis action]
   set severity [dict get $analysis severity]
   set reason [dict get $analysis reason]
   set containers_to_down [dict get $analysis containers_to_down]
   set action_executed false
 
+  if { $severity ne "critical" } {
+    log_message "WARNING" "$reason"
+    return false
+  }
+
+  # Depois de parar um container, espera ele subir e a média refletir a parada antes de agir de novo.
+  # Sem isso a média da janela continua crítica e o monitor para container atrás de container
+  # (inclusive o mesmo, enquanto ele ainda está inicializando).
+  set since_last_stop [expr { [clock seconds] - $last_stop_time }]
+  if { $since_last_stop < $CONFIG(stop_cooldown) } {
+    log_message "INFO" "$reason - aguardando ${since_last_stop}s/$CONFIG(stop_cooldown)s desde a última parada"
+    return false
+  }
+
   if { [llength $containers_to_down] > 0 } {
     foreach container $containers_to_down {
-      set reason [dict get $container reason]
+      set container_reason [dict get $container reason]
       set service_name [dict get $container name]
       set id [dict get $container id]
       set cpu_usage [dict get $container cpu_usage]
       set memory_usage [dict get $container memory_usage]
 
-      send_telegram_notification "critical" "stoping_container" $reason
+      send_telegram_notification "critical" "stoping_container" "$reason. $container_reason"
 
       if {[stop_container $service_name $id $cpu_usage $memory_usage]} {
         send_telegram_notification "critical" "stoped_container" "container ${service_name} sucessfully stoped"
+        set action_executed true
       } else {
         send_telegram_notification "critical" "stop_container_error" "canot stop container ${service_name}"
       }
     }
+
+    # conta o cooldown mesmo se o stop falhar, para não tentar a cada coleta
+    set last_stop_time [clock seconds]
+  } elseif { $action eq "cleanup_docker" } {
+    send_telegram_notification "critical" "disk_critical" $reason
   } else {
-    send_telegram_notification "critical" "server_exhausted" "The server is exhausted, but no services were found to stop"
+    send_telegram_notification "critical" "server_exhausted" "$reason. The server is exhausted, but no services were found to stop"
   }
 
   #switch $action {
